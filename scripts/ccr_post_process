@@ -1,0 +1,202 @@
+#!/usr/bin/env python
+# encoding: utf-8
+
+import simtk.openmm as mm
+from simtk.openmm import app
+from simtk.unit import *
+import mdtraj
+import numpy as np
+import os
+import math
+import contextlib
+
+
+STATE_TEMPLATE = 'State{}'
+STEP_TEMPLATE = 'Step_{:03d}'
+kB = 8.314e-3  # kJ / mol / K
+temperature = 300.  # K
+kBT = temperature * kB  # kJ / mol
+h_planck = 3.99e-13  # kJ s / mol
+
+
+def main():
+    force_consts = load_force_consts()
+    n_steps = len(force_consts)
+
+    print 'Computing energies for State A'
+    with in_state('A'):
+        confinement_a = get_confinement_energy(force_consts)
+        enthalpy_a = get_enthalpy(n_steps)
+        entropy_a = get_entropy(n_steps)
+    print
+
+    print 'Computing energies for State B'
+    with in_state('B'):
+        confinement_b = get_confinement_energy(force_consts)
+        enthalpy_b = get_enthalpy(n_steps)
+        entropy_b = get_entropy(n_steps)
+    print
+
+    total = confinement_a + enthalpy_a + entropy_a - confinement_b - enthalpy_b - entropy_b
+    print 'Free Energies (kJ/mol)'
+    print '---------------------------------------------'
+    print 'State A:'
+    print '    Confiment free energy:            {: 8.2f}'.format(confinement_a)
+    print '    Residual enthalpy:                {: 8.2f}'.format(enthalpy_a)
+    print '    Residual entropic free energy:    {: 8.2f}'.format(entropy_a)
+    print 'State B:'
+    print '    Confiment free energy:            {: 8.2f}'.format(confinement_b)
+    print '    Residual enthalpy:                {: 8.2f}'.format(enthalpy_b)
+    print '    Residual entropic free energy:    {: 8.2f}'.format(entropy_b)
+    print '----------------------------------------------'
+    print 'Total free energy difference (A - B): {: 8.2f}'.format(total)
+    print
+
+
+def load_force_consts():
+    force_consts = []
+    with open('restraint_strengths.txt') as infile:
+        # first two lines are comments
+        infile.readline()
+        infile.readline()
+        for line in infile:
+            line = line.strip()
+            force_consts.append(float(line))
+    return force_consts
+
+
+def get_confinement_energy(force_consts):
+    print '    Computing confinement energy.'
+
+    n_steps = len(force_consts)
+
+    # load the reference coordinates
+    print '    Loading reference coordinates.'
+    pdb = app.pdbfile.PDBFile(os.path.join(STEP_TEMPLATE.format(n_steps), 'system.pdb'))
+    ref_coords = np.array(pdb.getPositions().value_in_unit(nanometers))
+
+    print '    Computing chi squared.'
+    chi_sq = [compute_chi_sq(i + 1, ref_coords) for i in range(n_steps)]
+
+    print '    Integrating confiment free energy.'
+    delta_G = integrate_confiment(chi_sq, force_consts)
+    return delta_G
+
+
+def compute_chi_sq(step, ref_coords):
+    with in_step(step):
+        # load the trajectory
+        traj = mdtraj.load('output.dcd', top='system.pdb')
+
+        # compute the difference from the reference coordinates
+        diff2 = (traj.xyz - ref_coords) ** 2
+        diff2 = np.sum(diff2, axis=2)  # axis=2 is x, y, z
+
+    # average over all atoms and all frames and take root
+    return np.mean(diff2)
+
+
+def integrate_confiment(chi_sq, force_consts):
+    # now we compute the remaining terms using Eq. 14 from
+    # M. Cecchini et al, 2009
+    L = []
+    for i in range(len(force_consts) - 1):
+        j = i + 1
+        b = (math.log(chi_sq[j]) - math.log(chi_sq[i])) / (math.log(force_consts[j]) - math.log(force_consts[i]))
+        l = 1 / (b + 1.0) * (chi_sq[j] * force_consts[j] - chi_sq[i] * force_consts[i])
+        L.append(l)
+    return sum(L)
+
+
+def get_enthalpy(last_step):
+    print '    Computing residual enthalpy.'
+    with in_step(last_step):
+        # load the openmm system from disk
+        system = mm.XmlSerializer.deserializeSystem(open('system.xml').read())
+
+        # load the pdb file
+        pdb = app.pdbfile.PDBFile('system.pdb')
+
+        # load the trajectory from disk
+        traj = mdtraj.load('output.dcd', top='system.pdb')
+
+        # dummy integrator, not really used but we need to specify one
+        integrator = mm.LangevinIntegrator(300 * kelvin, 1 / picosecond, 0.002 * picoseconds)
+        simulation = app.Simulation(pdb.topology, system, integrator)
+
+        energies = []
+        for frame in range(traj.n_frames):
+            simulation.context.setPositions(traj.xyz[frame, :, :])
+            energy = simulation.context.getState(getEnergy=True).getPotentialEnergy()
+            energy = energy.value_in_unit(kilojoules / moles)
+            energies.append(energy)
+    return np.mean(energies)
+
+
+def get_entropy(last_step):
+    print '    Computing residual entropy.'
+    with in_step(last_step):
+        # load the openmm system, we need the masses
+        system = mm.XmlSerializer.deserializeSystem(open('system.xml').read())
+
+        # get the masses and make a diagonal matrix out of them
+        masses = [system.getParticleMass(i).value_in_unit(dalton) for i in range(system.getNumParticles())]
+        masses = np.array(masses)
+
+        # load the trajectory
+        traj = mdtraj.load('output.dcd', top='system.pdb')
+
+        # get the inverse frequencies and compute the entropy
+        inv_omega = get_quasiharmonic_modes(traj, masses)
+        S = kB * np.sum(np.log(kBT * inv_omega / h_planck))
+    return temperature * S
+
+
+def get_quasiharmonic_modes(traj, masses):
+    n_atoms = traj.n_atoms
+    n_frames = traj.n_frames
+
+    # make a diagonal matrix out of the masses
+    masses = np.repeat(masses, 3)
+    masses = np.diag(masses)
+
+    # reshape the trajectory to be 3 x n_atoms, n_frames
+    traj = traj.xyz.reshape(n_atoms * 3, n_frames)
+
+    # apply mass weighting
+    y = np.dot(masses ** 0.5, traj)
+
+    # mean center and weight
+    y = y.T
+    y = y - np.mean(y, axis=0)
+    y = 1.0 / math.sqrt(n_frames - 1) * y
+
+    # compute the svd
+    print '    Computing singular value decomposition. This may take a while.'
+    u, s, v = np.linalg.svd(y)
+
+    inv_omega = s / math.sqrt(kBT)
+
+    return inv_omega
+
+
+@contextlib.contextmanager
+def in_step(step):
+    os.chdir(STEP_TEMPLATE.format(step))
+    try:
+        yield
+    finally:
+        os.chdir('..')
+
+
+@contextlib.contextmanager
+def in_state(state):
+    os.chdir(STATE_TEMPLATE.format(state))
+    try:
+        yield
+    finally:
+        os.chdir('..')
+
+
+if __name__ == '__main__':
+    main()
