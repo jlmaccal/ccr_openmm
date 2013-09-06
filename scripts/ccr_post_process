@@ -85,15 +85,19 @@ def get_confinement_energy(force_consts):
 
 def compute_chi_sq(step, ref_coords):
     with in_step(step):
-        # load the trajectory
-        traj = mdtraj.load('output.dcd', top='system.pdb')
+        # load the reference and trajectory
+        ref = mdtraj.load('system.pdb')
+        traj = mdtraj.load('output.dcd', top=ref)
 
-        # compute the difference from the reference coordinates
-        diff2 = (traj.xyz - ref_coords) ** 2
-        diff2 = np.sum(diff2, axis=2)  # axis=2 is x, y, z
+        # make rmsd caches
+        ref_cache = mdtraj.rmsd_cache(ref)
+        traj_cache = mdtraj.rmsd_cache(traj)
 
-    # average over all atoms and all frames and take root
-    return np.mean(diff2)
+        # compute the RMSDs
+        rmsds = traj_cache.rmsds_to(ref_cache, 0)
+        chi_sq = np.mean(traj.n_atoms * rmsds ** 2)
+
+    return chi_sq
 
 
 def integrate_confiment(chi_sq, force_consts):
@@ -105,7 +109,7 @@ def integrate_confiment(chi_sq, force_consts):
         b = (math.log(chi_sq[j]) - math.log(chi_sq[i])) / (math.log(force_consts[j]) - math.log(force_consts[i]))
         l = 1 / (b + 1.0) * (chi_sq[j] * force_consts[j] - chi_sq[i] * force_consts[i])
         L.append(l)
-    return sum(L)
+    return 0.5 * sum(L)
 
 
 def get_enthalpy(last_step):
@@ -136,47 +140,49 @@ def get_enthalpy(last_step):
 def get_entropy(last_step):
     print '    Computing residual entropy.'
     with in_step(last_step):
+        # load the reference and get the heavy atom indices
+        ref = mdtraj.load('system.pdb')
+        indices = [atom.index for atom in ref.topology.atoms if atom.element.symbol != 'H']
+
+        # now load just the heavy atoms from the trajectory
+        traj = mdtraj.load('output.dcd', top='system.pdb', atom_indices=indices)
+
         # load the openmm system, we need the masses
         system = mm.XmlSerializer.deserializeSystem(open('system.xml').read())
 
         # get the masses and make a diagonal matrix out of them
-        masses = [system.getParticleMass(i).value_in_unit(dalton) for i in range(system.getNumParticles())]
+        masses = [system.getParticleMass(i).value_in_unit(dalton) for i in range(system.getNumParticles()) if i in indices]
         masses = np.array(masses)
-
-        # load the trajectory
-        traj = mdtraj.load('output.dcd', top='system.pdb')
 
         # get the inverse frequencies and compute the entropy
         inv_omega = get_quasiharmonic_modes(traj, masses)
-        S = kB * np.sum(np.log(kBT * inv_omega / h_planck))
-    return temperature * S
+        S = kB * np.log(inv_omega)
+
+    return -temperature * np.sum(S)
 
 
 def get_quasiharmonic_modes(traj, masses):
     n_atoms = traj.n_atoms
     n_frames = traj.n_frames
 
-    # make a diagonal matrix out of the masses
+    # repeat the masses 3 times, one each for x, y, z
     masses = np.repeat(masses, 3)
+    masses = np.sqrt(masses)
     masses = np.diag(masses)
 
     # reshape the trajectory to be 3 x n_atoms, n_frames
-    traj = traj.xyz.reshape(n_atoms * 3, n_frames)
+    traj = traj.xyz.reshape(n_frames, n_atoms * 3)
 
-    # apply mass weighting
-    y = np.dot(masses ** 0.5, traj)
+    # build the mass weighted covariance matrix
+    y = traj - np.mean(traj, axis=0)
+    y = np.cov(y.T)
+    y = np.dot(masses, np.dot(y, masses))
 
-    # mean center and weight
-    y = y.T
-    y = y - np.mean(y, axis=0)
-    y = 1.0 / math.sqrt(n_frames - 1) * y
+    print '    Diagonalizing the covariance matrix. This may take a while.'
+    vals, vecs = np.linalg.eigh(y)
 
-    # compute the svd
-    print '    Computing singular value decomposition. This may take a while.'
-    u, s, v = np.linalg.svd(y)
-
-    inv_omega = s / math.sqrt(kBT)
-
+    vals = np.sort(np.abs(vals))
+    inv_omega = np.sqrt(vals)
     return inv_omega
 
 
