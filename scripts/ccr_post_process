@@ -154,9 +154,9 @@ def get_entropy(last_step):
         masses = [system.getParticleMass(i).value_in_unit(dalton) for i in range(system.getNumParticles()) if i in indices]
         masses = np.array(masses)
 
-        # get the inverse frequencies and compute the entropy
-        inv_omega = get_quasiharmonic_modes(traj, masses)
-        S = kB * np.log(inv_omega)
+        # get the variances and copute the entropy
+        variances = get_quasiharmonic_modes(traj, masses)
+        S = 0.5 * kB * np.log(1.0 + kBT * math.exp(2) / (h_planck / 2.0 / 3.14159) ** 2 * variances)
 
     return -temperature * np.sum(S)
 
@@ -182,8 +182,7 @@ def get_quasiharmonic_modes(traj, masses):
     vals, vecs = np.linalg.eigh(y)
 
     vals = np.sort(np.abs(vals))
-    inv_omega = np.sqrt(vals)
-    return inv_omega
+    return vals
 
 
 @contextlib.contextmanager
