@@ -37,7 +37,7 @@ def main():
         entropy_b = get_entropy(n_steps)
     print
 
-    total = confinement_a + enthalpy_a + entropy_a - confinement_b - enthalpy_b - entropy_b
+    total = confinement_a + enthalpy_b + entropy_b - enthalpy_a - entropy_a - confinement_b
     print 'Free Energies (kJ/mol)'
     print '---------------------------------------------'
     print 'State A:'
@@ -181,7 +181,7 @@ def get_quasiharmonic_modes(traj, masses):
     print '    Diagonalizing the covariance matrix. This may take a while.'
     vals, vecs = np.linalg.eigh(y)
 
-    vals = np.sort(np.abs(vals))
+    vals = np.sort(np.abs(vals))[-100:]
     return vals
 
 
