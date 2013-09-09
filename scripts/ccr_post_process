@@ -109,7 +109,7 @@ def integrate_confiment(chi_sq, force_consts):
         b = (math.log(chi_sq[j]) - math.log(chi_sq[i])) / (math.log(force_consts[j]) - math.log(force_consts[i]))
         l = 1 / (b + 1.0) * (chi_sq[j] * force_consts[j] - chi_sq[i] * force_consts[i])
         L.append(l)
-    return 0.5 * sum(L)
+    return sum(L)
 
 
 def get_enthalpy(last_step):
