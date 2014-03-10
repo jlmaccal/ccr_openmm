@@ -6,9 +6,11 @@ from simtk.openmm import app
 from simtk.unit import *
 import mdtraj
 import numpy as np
+import numpy.random as npr
 import os
 import math
 import contextlib
+from matplotlib import pyplot as pp
 
 
 STATE_TEMPLATE = 'State{}'
@@ -16,41 +18,61 @@ STEP_TEMPLATE = 'Step_{:03d}'
 kB = 8.314e-3  # kJ / mol / K
 temperature = 300.  # K
 kBT = temperature * kB  # kJ / mol
-h_planck = 3.99e-13  # kJ s / mol
+h_planck = 1.0546e-37 * 6.022e23  # kJ s / mol
 
 
 def main():
     force_consts = load_force_consts()
     n_steps = len(force_consts)
 
-    print 'Computing energies for State A'
+    print 'Computing energies'
+    print '    State A'
     with in_state('A'):
-        confinement_a = get_confinement_energy(force_consts)
-        enthalpy_a = get_enthalpy(n_steps)
-        entropy_a = get_entropy(n_steps)
-    print
-
-    print 'Computing energies for State B'
+        energies_a = get_enthalpy(n_steps)
+    print '    State B'
     with in_state('B'):
-        confinement_b = get_confinement_energy(force_consts)
-        enthalpy_b = get_enthalpy(n_steps)
-        entropy_b = get_entropy(n_steps)
+        energies_b = get_enthalpy(n_steps)
+    energy_mean = np.mean(energies_b) - np.mean(energies_a)
+    energy_sem = bootstrap_energies(energies_a, energies_b, 1000)
+    print '    Energy difference:                    {: 8.2f} +/- {: 8.2f}'.format(energy_mean, energy_sem)
     print
 
-    total = confinement_a + enthalpy_b + entropy_b - enthalpy_a - entropy_a - confinement_b
-    print 'Free Energies (kJ/mol)'
-    print '---------------------------------------------'
-    print 'State A:'
-    print '    Confiment free energy:            {: 8.2f}'.format(confinement_a)
-    print '    Residual enthalpy:                {: 8.2f}'.format(enthalpy_a)
-    print '    Residual entropic free energy:    {: 8.2f}'.format(entropy_a)
-    print 'State B:'
-    print '    Confiment free energy:            {: 8.2f}'.format(confinement_b)
-    print '    Residual enthalpy:                {: 8.2f}'.format(enthalpy_b)
-    print '    Residual entropic free energy:    {: 8.2f}'.format(entropy_b)
-    print '----------------------------------------------'
-    print 'Total free energy difference (A - B): {: 8.2f}'.format(total)
+
+    print 'Computing confinement'
+    print '    State A'
+    with in_state('A'):
+        chi_a = get_chi(force_consts)
+    print '    State B'
+    with in_state('B'):
+        chi_b = get_chi(force_consts)
+
+    a = np.array([np.mean(x) for x in chi_a])
+    b = np.array([np.mean(x) for x in chi_b])
+    c = np.array(force_consts)
+    np.savetxt('diff.dat', np.vstack([c, a - b]).T)
+    conf_mean, conf_std = bootstrap_confinement(force_consts, chi_a, chi_b, 1000)
+    print '    Confinement difference:               {: 8.2f} +/- {: 8.2f}'.format(conf_mean, conf_std)
     print
+
+
+    print 'Computing residual entropy'
+    with in_state('A'):
+        print '    State A'
+        entropy_a = get_entropy(n_steps)
+    with in_state('B'):
+        print '    State B'
+        entropy_b = get_entropy(n_steps)
+    print 'Residual entropic free energy difference: {: 8.2f}'.format(entropy_b - entropy_a)
+    print
+
+    total = energy_mean + conf_mean + entropy_b - entropy_a
+    err_est = math.sqrt(energy_sem ** 2 + conf_std ** 2)
+
+    print 'Total: {: 8.2f} +/- {: 8.2f}'.format(total, err_est)
+    print
+    print 'Warning: the error in the residual entropic contribution is not computed.'
+    print 'Warning: this code is experimental.'
+
 
 
 def load_force_consts():
@@ -65,39 +87,38 @@ def load_force_consts():
     return force_consts
 
 
-def get_confinement_energy(force_consts):
-    print '    Computing confinement energy.'
-
+def get_chi(force_consts):
     n_steps = len(force_consts)
 
     # load the reference coordinates
-    print '    Loading reference coordinates.'
     pdb = app.pdbfile.PDBFile(os.path.join(STEP_TEMPLATE.format(n_steps), 'system.pdb'))
     ref_coords = np.array(pdb.getPositions().value_in_unit(nanometers))
 
-    print '    Computing chi squared.'
     chi_sq = [compute_chi_sq(i + 1, ref_coords) for i in range(n_steps)]
 
-    print '    Integrating confiment free energy.'
-    delta_G = integrate_confiment(chi_sq, force_consts)
-    return delta_G
+    return chi_sq
+
+
+def get_confinement_energy(force_consts, chi_a, chi_b):
+    chi_a = np.array([np.mean(x) for x in chi_a])
+    chi_b = np.array([np.mean(x) for x in chi_b])
+    g_a = integrate_confiment(chi_a, force_consts)
+    g_b = integrate_confiment(chi_b, force_consts)
+    return g_a - g_b
 
 
 def compute_chi_sq(step, ref_coords):
     with in_step(step):
         # load the reference and trajectory
-        ref = mdtraj.load('system.pdb')
-        traj = mdtraj.load('output.dcd', top=ref)
+        traj = mdtraj.load('output.dcd', top='system.pdb')
 
-        # make rmsd caches
-        ref_cache = mdtraj.rmsd_cache(ref)
-        traj_cache = mdtraj.rmsd_cache(traj)
+        # compute the difference from the reference coordinates
+        diff2 = (traj.xyz - ref_coords) ** 2
+        diff2 = np.sum(diff2, axis=2)  # axis=2 is x, y, z
+        diff2 = np.sum(diff2, axis=1)  # axis=1 is atoms
 
-        # compute the RMSDs
-        rmsds = traj_cache.rmsds_to(ref_cache, 0)
-        chi_sq = np.mean(traj.n_atoms * rmsds ** 2)
-
-    return chi_sq
+        # average over all frames
+    return diff2
 
 
 def integrate_confiment(chi_sq, force_consts):
@@ -113,7 +134,6 @@ def integrate_confiment(chi_sq, force_consts):
 
 
 def get_enthalpy(last_step):
-    print '    Computing residual enthalpy.'
     with in_step(last_step):
         # load the openmm system from disk
         system = mm.XmlSerializer.deserializeSystem(open('system.xml').read())
@@ -129,16 +149,17 @@ def get_enthalpy(last_step):
         simulation = app.Simulation(pdb.topology, system, integrator)
 
         energies = []
-        for frame in range(traj.n_frames):
+        for frame in range(1, traj.n_frames):
             simulation.context.setPositions(traj.xyz[frame, :, :])
             energy = simulation.context.getState(getEnergy=True).getPotentialEnergy()
             energy = energy.value_in_unit(kilojoules / moles)
             energies.append(energy)
-    return np.mean(energies)
+        np.savetxt('energies.dat', energies)
+    energies = np.array(energies)
+    return energies
 
 
 def get_entropy(last_step):
-    print '    Computing residual entropy.'
     with in_step(last_step):
         # load the reference and get the heavy atom indices
         ref = mdtraj.load('system.pdb')
@@ -156,9 +177,37 @@ def get_entropy(last_step):
 
         # get the variances and copute the entropy
         variances = get_quasiharmonic_modes(traj, masses)
-        S = 0.5 * kB * np.log(1.0 + kBT * math.exp(2) / (h_planck / 2.0 / 3.14159) ** 2 * variances)
-
+        alpha = h_planck / math.sqrt(kBT) / np.sqrt(variances)
+        S = kB * np.log(alpha)
+    # return get_schlitter(traj, masses)
     return -temperature * np.sum(S)
+
+
+# this is broken!
+def get_schlitter(traj, masses):
+    n_atoms = traj.n_atoms
+    n_frames = traj.n_frames
+
+    # repeat the masses 3 times, one each for x, y, z
+    masses = np.repeat(masses, 3)
+    masses = np.sqrt(masses)
+    masses = np.diag(masses)
+
+    # reshape the trajectory to be 3 x n_atoms, n_frames
+    traj = traj.xyz.reshape(n_frames, n_atoms * 3)
+
+    # build the mass weighted covariance matrix
+    y = (traj - np.mean(traj, axis=0)) * 1e-9  # put things in meters
+    y = np.cov(y.T)
+    y = np.dot(masses, y)
+
+    # now solve for the entropy using schlitter's forumula
+    y = 1.0 + (kBT * math.exp(2) / h_planck ** 2) * y
+    print 'blah'
+    sign, det = np.linalg.slogdet(y)
+    s = -0.5 * kBT * sign * det
+    print s
+    return s
 
 
 def get_quasiharmonic_modes(traj, masses):
@@ -178,11 +227,10 @@ def get_quasiharmonic_modes(traj, masses):
     y = np.cov(y.T)
     y = np.dot(masses, np.dot(y, masses))
 
-    print '    Diagonalizing the covariance matrix. This may take a while.'
     vals, vecs = np.linalg.eigh(y)
 
-    vals = np.sort(np.abs(vals))[-100:]
-    return vals
+    vals = np.sort(np.abs(vals))
+    return vals * 1e-18  # nm^2 to m^2
 
 
 @contextlib.contextmanager
@@ -201,6 +249,49 @@ def in_state(state):
         yield
     finally:
         os.chdir('..')
+
+
+def bootstrap(data, num_samples, statistic, alpha):
+    """Returns bootstrap estimate of 100.0*(1-alpha) CI for statistic."""
+    n = len(data)
+    idx = npr.randint(0, n, (num_samples, n))
+    samples = data[idx]
+    stat = np.sort(statistic(samples, 1))
+    return (stat[int((alpha / 2.0) * num_samples)],
+            stat[int((1 -alpha / 2.0) * num_samples)])
+
+
+def bootstrap_energies(energy_a, energy_b, n_samples):
+    n_a = len(energy_a)
+    n_b = len(energy_b)
+
+    idx_a = npr.randint(0, n_a, (n_samples, n_a))
+    idx_b = npr.randint(0, n_b, (n_samples, n_b))
+
+    samples_a = energy_a[idx_a]
+    samples_b = energy_b[idx_b]
+    means_a = np.mean(samples_a, 1)
+    means_b = np.mean(samples_b, 1)
+
+    return np.std(means_b - means_a)
+
+
+def gen_bootstrap(data):
+    n = len(data)
+    return npr.choice(data, n, replace=True)
+
+
+def bootstrap_confinement(force_consts, chi_a, chi_b, n_samples):
+    mean = get_confinement_energy(force_consts, chi_a, chi_b)
+
+    diffs = []
+    for i in range(n_samples):
+        sample_a = [gen_bootstrap(x) for x in chi_a]
+        sample_b = [gen_bootstrap(x) for x in chi_b]
+        diff = get_confinement_energy(force_consts, sample_a, sample_b)
+        diffs.append(diff)
+    std = np.std(diffs)
+    return mean, std
 
 
 if __name__ == '__main__':
